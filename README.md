@@ -1,103 +1,257 @@
-# Bluetooth Mouse Troubleshooting on Linux (Qualcomm QCA9377 BLE Fix)
+# Linux Bluetooth Troubleshooting Guide
 
-This repository contains documentation and a self-healing automation script to fix Bluetooth Low Energy (BLE) scanning issues on Qualcomm Atheros QCA9377 Bluetooth adapters under Linux (such as Arch Linux, Manjaro, or Debian/Ubuntu).
-
-## The Symptom
-
-Your Bluetooth mouse (e.g., Logitech MX Master 2S, which utilizes BLE exclusively) successfully pairs and connects, but the pointer does not move. After a short period, the connection drops.
-
-Kernel logs (`dmesg`) spam the following error every ~16 seconds:
-```
-[  401.775514] Bluetooth: hci0: unexpected event for opcode 0x2005
-```
-*   **Opcode `0x2005`** corresponds to `LE Set Scan Parameters`. This indicates that BLE scanning is broken at the hardware/HCI level.
-*   The driver is loaded as generic Bluetooth, but **no Qualcomm firmware initialization (`btqca`) ever occurred**.
+This repository contains documentation and tools for diagnosing and fixing common Bluetooth adapter issues on Linux (such as Arch Linux, Manjaro, or Debian/Ubuntu). 
 
 ---
 
-## The Root Cause
+## Unified Diagnostic Flow
 
-The Qualcomm QCA9377 Bluetooth adapter (USB Vendor/Product ID `13d3:3503` or similar OEM variants) binds to the generic `btusb` driver via **class matching** (as a generic USB Bluetooth device) rather than as a named Qualcomm device. 
+When Bluetooth is not working (e.g., your mouse connects but doesn't move, or the Bluetooth controller cannot be turned on), follow these steps to identify your adapter and find the right fix:
 
-Because of this, `btusb` never triggers the `btqca` firmware loading path. The device operates on its raw ROM firmware, which has a bug that crashes BLE scanning (`opcode 0x2005`). 
-
-This is not a kernel regression—these specific USB IDs were simply never added to the driver's hardcoded QCA Rome whitelist.
-
----
-
-## Why Standard Dynamic ID Bindings (`new_id`) Fail
-
-A common troubleshooting suggestion online is to register the device ID dynamically with the driver via sysfs:
+### Step 1: Identify your Bluetooth Controller (USB ID)
+Run the following command to find your Bluetooth USB interface:
 ```bash
-# This is a standard recommendation that DOES NOT WORK for QCA devices:
-echo "13d3 3503 0 0 0 0 0x00040000" > /sys/bus/usb/drivers/btusb/new_id
+lsusb | grep -i -E "blue|wireless|bt"
 ```
+*   **If you see `MediaTek Inc.` (e.g., ID `0e8d:7902`):** Go to [Case 2: MediaTek MT7902 (rfkill Soft-Block)](#case-2-mediatek-mt7902-rfkill-soft-block).
+*   **If you see `Qualcomm` or `Atheros` (e.g., ID `13d3:3503`):** Go to [Case 1: Qualcomm QCA9377 (BLE Connection Bug)](#case-1-qualcomm-qca9377-ble-connection-bug).
 
-This fails for two reasons:
-1. **SSCANF Limitations**: The USB dynamic ID sysfs handler in `drivers/usb/core/driver.c` only parses up to 5 fields (Vendor, Product, bInterfaceClass, refVendor, refProduct). It has no 7-field or 12-field parser to map the 12th field (`driver_info`) directly from userspace.
-2. **Qualcomm is Private**: To set configuration flags dynamically, you must pass a reference device (`refVendor` and `refProduct`) to copy flags from. However, the parser only searches the driver's public device table (`btusb_table[]`). In `btusb.c`, all Qualcomm Rome entries are kept inside a private structure (`blacklist_table[]`). Thus, writing a reference device like `0cf3 e300` fails with `No such device` (ENODEV).
+### Step 2: Check Adapter Status and Kernel Logs
+Run these diagnostic commands to see how the adapter is behaving:
+```bash
+# Check if blocked by the OS
+rfkill list
+
+# Check the system service status
+systemctl status bluetooth
+
+# Inspect Bluetooth kernel logs for general issues
+sudo dmesg | grep -i -E "blue|hci0|btusb|btqca" | tail -n 30
+
+# Inspect the system journal specifically for Bluetooth daemon errors
+sudo journalctl -b -u bluetooth | grep -i -E "error|fail|unlikely" | tail -n 20
+```
 
 ---
 
-## The Solution: Surgical Binary Patching
+## Case 1: Qualcomm QCA9377 (BLE Connection Bug)
 
-Since we cannot use the sysfs `new_id` interface to dynamically assign the QCA Rome driver flags, the most robust and elegant solution is to **binary-patch the active `btusb.ko` module** to replace a statically compiled, unused Qualcomm Rome device ID with your card's device ID.
+### 1. Symptoms
+* Your Bluetooth mouse (e.g., Logitech MX Master 2S, which utilizes BLE exclusively) successfully pairs and connects, but the pointer does not move. After a short period, the connection drops.
+* Kernel logs (`dmesg`) spam the following error every ~16 seconds:
+  ```
+  Bluetooth: hci0: unexpected event for opcode 0x2005
+  ```
+  *(Opcode `0x2005` corresponds to `LE Set Scan Parameters`, indicating BLE scanning is broken at the hardware/HCI level).*
 
-### 1. Locate and Patch the Device ID Table
-In 64-bit Linux, the size of a `usb_device_id` struct is exactly 32 bytes:
-```c
-struct usb_device_id {
-    __u16 match_flags;      // 2 bytes
-    __u16 idVendor;         // 2 bytes
-    __u16 idProduct;        // 2 bytes
-    ... [padding/class] ... // 18 bytes
-    kernel_ulong_t drv_info;// 8 bytes (BTUSB_QCA_ROME | BTUSB_WIDEBAND_SPEECH = 0x204000)
-};
-```
-The standard Atheros/Qualcomm Rome ID is `0cf3:e300` which maps to:
-- Hex: `03 00 f3 0c 00 e3 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 40 20 00 00 00 00 00` (32 bytes)
+### 2. How to Identify
+* Run `lsusb` and look for Qualcomm Atheros (typically ID `13d3:3503` or similar OEM variants).
+* Run `sudo dmesg | grep -i btqca`. If no output is returned, **no Qualcomm firmware initialization ever occurred**, and the driver is loaded as generic class-matched Bluetooth.
 
-By searching the compiled `btusb.ko` binary for this pattern and replacing `0cf3` (`f3 0c`) and `e300` (`00 e3`) with your native adapter ID (e.g., `13d3:3503`), we statically register your device in the driver's blacklist table.
+### 3. Root Cause
+The QCA9377 adapter binds to the generic `btusb` driver via class matching (as a generic USB Bluetooth device) rather than as a named Qualcomm device because these specific OEM USB IDs are missing from the driver's hardcoded QCA Rome whitelist. 
+Without this whitelist mapping, `btusb` never triggers the `btqca` firmware loader. The device operates on its raw, buggy ROM firmware which crashes during BLE scanning.
 
-### 2. Bypass Module Signature Check
-The running kernel enforces module signatures (`CONFIG_MODULE_SIG=y`). Binary patching the module breaks its signature, causing `modprobe` to fail with `Key was rejected by service`.
+> **Note on Standard Fixes:** Dynamically registering the ID with `new_id` (`echo "13d3 3503..." > .../new_id`) fails because the USB dynamic ID sysfs handler cannot parse private configuration structures, and the Qualcomm Rome entry table is private in `btusb.c`.
 
-However, on most systems, strict signature enforcement is disabled (`# CONFIG_MODULE_SIG_FORCE is not set`). This means the kernel will load completely unsigned modules.
-* Running **`strip --strip-debug`** on the patched `.ko` file strips all debug symbols and automatically chops off the appended signature block.
-* This leaves a perfectly clean, unsigned module that the kernel loads without any errors.
-
----
-
-## Automated Patch Script
+### 4. How to Recover: Surgical Binary Patching
+Since we cannot dynamically inject the ID, we **binary-patch the active `btusb.ko` module** to replace an unused Qualcomm Rome device ID with your card's device ID.
 
 The provided script `patch-btusb.sh` automates this entire process:
-1. Finds the active running kernel and locates the `btusb.ko.zst` file.
+1. Locates the active kernel's `btusb.ko.zst` file.
 2. Creates a secure backup (`btusb.ko.zst.bak`).
-3. Decompress the backup, uses Python to do an in-place binary search-and-replace for QCA Rome reference ID candidates, and writes the patched binary.
-4. Strips the signature block using `strip --strip-debug`.
-5. Compresses the module back to `.zst` format and overwrites the system driver.
-6. Reloads the module to immediately apply the fix.
+3. Decompresses the module, uses Python to do an in-place binary search-and-replace for QCA Rome reference ID candidates, and writes the patched binary.
+4. Strips the signature block using `strip --strip-debug` so the kernel loads the unsigned patched module (bypassing signature mismatch).
+5. Compresses the module back and overwrites the system driver.
+6. Reloads the driver to immediately apply the fix.
 
-### Usage
+#### Execution
+Configure your target VID and PID in `patch-btusb.sh` if they differ from the QCA9377 default (`13d3:3503`), then run:
+```bash
+chmod +x patch-btusb.sh
+sudo ./patch-btusb.sh
+```
 
-1. Clone this repository.
-2. Configure your target VID and PID in `patch-btusb.sh` if they differ from the QCA9377 default (`13d3:3503`).
-3. Make the script executable and run with `sudo`:
+---
+
+## Case 2: MediaTek MT7902 (rfkill Soft-Block)
+
+### 1. Symptoms
+* The system Bluetooth service fails to start, or fails to power on your controller.
+* System logs (`journalctl`) show:
+  ```
+  bluetoothd: Failed to set default system config for hci0
+  bluetoothd: Failed to set mode: Failed (0x03)
+  ```
+* You cannot discover or connect to any Bluetooth devices.
+
+### 2. How to Identify
+* Run `lsusb` and look for MediaTek (typically ID `0e8d:7902` Wireless_Device).
+* Inspect `dmesg` to verify firmware initialized properly:
+  ```
+  Bluetooth: hci0: HW/SW Version: 0x008a008a, Build Time: 20250826211444
+  Bluetooth: hci0: Device setup in 204496 usecs
+  ```
+  If firmware logs are present, the driver and card are fully functional.
+
+### 3. Root Cause
+The MediaTek MT7902 Bluetooth card is natively supported by modern Linux kernels and handles firmware setup correctly. However, the system's software/hardware RF switch (`rfkill`) has **soft-blocked** the adapter, causing the system service `bluetoothd` to log `Failed (0x03)` when trying to change its power state.
+
+### 4. How to Recover: rfkill Unblocking
+No binary patching or custom drivers are required. You only need to clear the soft-block.
+
+#### Execution
+1. Check the block status of your adapter:
    ```bash
-   chmod +x patch-btusb.sh
-   sudo ./patch-btusb.sh
+   rfkill list
+   ```
+   If `hci0: Bluetooth` shows `Soft blocked: yes`, proceed.
+2. Unblock the Bluetooth subsystem:
+   ```bash
+   sudo rfkill unblock bluetooth
+   ```
+3. Restart or re-trigger the Bluetooth daemon:
+   ```bash
+   sudo systemctl restart bluetooth
+   ```
+4. Confirm `rfkill list` now shows `Soft blocked: no` and that you can scan/connect to devices.
+
+---
+
+## Case 3: Bluetooth LE (GATT) Connection/Reconnection Failure
+
+### 1. Symptoms
+* A Bluetooth Low Energy (BLE) device (such as a modern BLE mouse or keyboard) successfully connects, but the **cursor/pointer does not move** and the keyboard inputs are not registered.
+* Within 10 to 30 seconds, the device **automatically disconnects** and disappears from the paired devices list.
+* **Side Effect:** During pairing or connection attempts, random nearby BLE devices (showing raw MAC addresses or temporary name fragments like `ty`) briefly appear in your Bluetooth manager GUI and then disappear.
+* System logs (`journalctl -u bluetooth`) are filled with the following errors from `bluetoothd`:
+  ```text
+  bluetoothd: profiles/deviceinfo/deviceinfo.c:read_pnpid_cb() Error reading PNP_ID value: Request attribute has encountered an unlikely error
+  bluetoothd: profiles/input/hog-lib.c:info_read_cb() HID Information read failed: Request attribute has encountered an unlikely error
+  bluetoothd: profiles/input/hog-lib.c:report_read_cb() Error reading Report value: Request attribute has encountered an unlikely error
+  ```
+
+### 2. How to Identify
+* Run the following command to check if your Bluetooth daemon is failing to communicate over GATT with your BLE mouse/keyboard:
+  ```bash
+  sudo journalctl -b -u bluetooth | grep -i "unlikely error"
+  ```
+  If you see `Request attribute has encountered an unlikely error` from `hog-lib.c` (HID over GATT) or `deviceinfo.c`, you are experiencing this issue.
+
+### 3. Root Cause
+The "Unlikely Error" (ATT/GATT Protocol Error `0x0E`) occurs when `bluetoothd` tries to read or write specific device characteristics (like PNP IDs, battery levels, or HID reports), but the connection state is unauthenticated, keys are out-of-sync, or the device's firmware rejects the request.
+This is typically caused by:
+1. **Stale Pairing Keys / GATT Cache:** A mismatch between the pairing keys or cached GATT service attributes stored in `/var/lib/bluetooth/` and those on the mouse itself (often occurring after re-pairing, dual-booting, or firmware updates).
+2. **Aggressive USB Autosuspend / Power Management:** The kernel powers down the Bluetooth adapter or transitions the BLE connection to an idle state before the GATT discovery handshake is complete.
+
+---
+
+### 4. How to Recover
+
+Follow these steps in order to clear the stale state and establish a healthy BLE connection:
+
+#### Method A: The "Clean Slate" Pairing (Most Effective)
+Often, standard GUI unpairing does not clear the filesystem cache, leading to persistent key mismatches. Purging the GATT cache and pairing via the CLI is the most reliable fix.
+
+1. **Check for `bluetoothctl`:**
+   If `bluetoothctl` is missing on your system, install it using your package manager:
+   * **Arch Linux / Manjaro:** `sudo pacman -S bluez-utils`
+   * **Debian / Ubuntu / Pop!_OS:** `sudo apt install bluez`
+
+2. **Open the interactive CLI:**
+   ```bash
+   bluetoothctl
    ```
 
-### Survival Across Kernel Updates
-Since system package managers (like `pacman` or `apt`) will overwrite `btusb.ko.zst` during kernel updates, keep this script in your home directory or `/usr/local/bin/`. After any kernel update, simply run the script once to re-apply the patch.
+3. **List paired devices:**
+   Find your mouse's MAC address (e.g., `XX:XX:XX:XX:XX:XX`):
+   ```text
+   [bluetooth]# devices
+   ```
+   *Note: If `devices` returns empty, the device is completely forgotten and you can jump straight to Step 5.*
+
+4. **Remove and disconnect the device (if listed):**
+   ```text
+   [bluetooth]# remove XX:XX:XX:XX:XX:XX
+   [bluetooth]# disconnect XX:XX:XX:XX:XX:XX
+   ```
+
+5. **Put your mouse/keyboard into pairing mode:**
+   Hold down the connection/channel button on the bottom of your device until its LED flashes rapidly.
+
+6. **Pair, trust, and connect manually:**
+   ```text
+   [bluetooth]# scan on
+   # Wait for your device to appear in the list with its MAC address
+   [bluetooth]# pair XX:XX:XX:XX:XX:XX
+   [bluetooth]# trust XX:XX:XX:XX:XX:XX
+   [bluetooth]# connect XX:XX:XX:XX:XX:XX
+   ```
+   *Verification: Upon successful pairing and connection, you should see your terminal output populate with discovered services (e.g., `[NEW] Primary Service`, `[NEW] Characteristic`). If these resolve without "unlikely error" logs in the background, your device is fully operational.*
+
+7. **Stop scanning:**
+   ```text
+   [bluetooth]# scan off
+   ```
+
+#### Method B: Manually Purging the GATT Cache
+If the issue persists, you can force the Bluetooth daemon to perform a full, fresh GATT database discovery by deleting the stored attribute cache.
+
+1. Stop the Bluetooth service:
+   ```bash
+   sudo systemctl stop bluetooth
+   ```
+2. Locate and remove the cached databases (replace `AA:AA:AA:AA:AA:AA` with your adapter's local MAC address):
+   ```bash
+   # Delete the cached attribute mappings
+   sudo rm -rf /var/lib/bluetooth/AA:AA:AA:AA:AA:AA/cache/
+   ```
+3. Restart the Bluetooth service:
+   ```bash
+   sudo systemctl start bluetooth
+   ```
+
+#### Method C: Adjusting `main.conf` Workarounds
+For persistent connection dropouts on BLE mice, you can disable GATT caching or enable automatic repairing by editing `/etc/bluetooth/main.conf`:
+
+1. Open the configuration file:
+   ```bash
+   sudo nano /etc/bluetooth/main.conf
+   ```
+2. Under the `[General]` section, make sure the following options are set:
+   ```ini
+   [General]
+   JustWorksRepairing = always
+   FastConnectable = true
+   ```
+3. Under the `[GATT]` section, you can optionally disable caching if the mouse firmware has buggy attribute maps:
+   ```ini
+   [GATT]
+   Cache = no
+   ```
+4. Save the file and restart Bluetooth:
+   ```bash
+   sudo systemctl restart bluetooth
+   ```
+
+---
+
+## Useful Commands Cheat Sheet
+
+| Command | Purpose |
+| :--- | :--- |
+| `lsusb \| grep -i bluetooth` | Identify Bluetooth adapter vendor and product IDs |
+| `rfkill list` | Check if wireless devices are soft/hard blocked |
+| `sudo rfkill unblock bluetooth` | Lift all software blocks on Bluetooth adapters |
+| `systemctl status bluetooth` | View current state and errors of the Bluetooth service |
+| `sudo journalctl -b -u bluetooth` | View logs for the Bluetooth service since last boot |
+| `sudo dmesg \| grep -i -E 'blue\|bt'` | View kernel ring buffer messages related to Bluetooth |
 
 ---
 
 ## Contributing Upstream
 
-The permanent fix is to submit a patch to the Linux Bluetooth subsystem mailing list: `linux-bluetooth@vger.kernel.org`. 
-
-If your adapter ID is missing, submit the following patch to the maintainers to have it whitelisted natively in future Linux releases:
+If you have a missing Qualcomm adapter ID, submit the following patch to the Linux Bluetooth subsystem mailing list `linux-bluetooth@vger.kernel.org` to have it whitelisted natively in future Linux releases:
 
 ```diff
 diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c

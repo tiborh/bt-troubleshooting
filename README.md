@@ -251,15 +251,14 @@ For persistent connection dropouts on BLE mice, you can disable GATT caching or 
 
 ## Contributing Upstream
 
-<<<<<<< HEAD
 If you have a missing Qualcomm adapter ID, submit the following patch to the Linux Bluetooth subsystem mailing list `linux-bluetooth@vger.kernel.org` to have it whitelisted natively in future Linux releases:
-=======
+
 The permanent fix is to submit a patch to the Linux Bluetooth subsystem mailing list: `linux-bluetooth@vger.kernel.org`. 
 
 Sanitized USB descriptor and collection data for the `13d3:3503` controller is stored in [`diagnostics/qca9377-13d3-3503-sanitized.md`](diagnostics/qca9377-13d3-3503-sanitized.md) so follow-up maintainer requests can be answered without reintroducing personal data.
  
 If your adapter ID is missing, submit the following patch to the maintainers to have it whitelisted natively in future Linux releases:
->>>>>>> 2c22f5d (added info after diagnostic data has been requested as a follow up of the patch pull request)
+2c22f5d (added info after diagnostic data has been requested as a follow up of the patch pull request)
 
 ```diff
 diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
